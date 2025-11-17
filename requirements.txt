@@ -2,6 +2,4 @@ streamlit
 pandas
 altair
 gspread
-gspread-dataframe
-gspread-formatting
-streamlit-gsheets-connection
+oauth2client
