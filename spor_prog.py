@@ -2,18 +2,41 @@ import streamlit as st
 import pandas as pd
 import datetime
 import os
-import json
+import json 
 import altair as alt
-# === EN ÖNEMLİ DÜZELTME: Bu satır eksikti ===
-from streamlit_gsheets.connection import GSheetsConnection
+import gspread # YENİ: Doğrudan Google'ın kütüphanesini kullanıyoruz
+from oauth2client.service_account import ServiceAccountCredentials # YENİ: Kimlik doğrulama için
 
-# --- GSheets Veritabanı Bağlantısını Kur ---
-# Artık 'GSheetsConnection' tanınıyor olacak.
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- GSheets Veritabanı Bağlantısını Kur (YENİ YÖNTEM) ---
 
-# --- Antrenman Programı ---
+# Bu fonksiyon, Streamlit'in "Secrets" (Gizli Anahtarlar) bölümünden robotun şifresini
+# (service_account_info) ve E-Tablo adını (worksheet_name) okur.
+def connect_gsheets():
+    try:
+        # Secrets'tan robotun JSON şifresini al
+        creds_json = st.secrets["connections"]["gsheets"]["service_account_info"]
+        # Secrets'tan E-Tablo adını al
+        worksheet_name = st.secrets["connections"]["gsheets"]["worksheet_name"]
+        
+        # Google API'lerine bağlanmak için kimlik doğrula
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+        client = gspread.authorize(creds)
+        
+        # E-Tablo'yu adıyla aç ve istemciyi döndür
+        spreadsheet = client.open(worksheet_name)
+        return spreadsheet
+    except Exception as e:
+        st.error(f"Google Sheets'e bağlanırken kritik hata (Secrets kontrolü): {e}")
+        return None
+
+# Bağlantıyı bir kez çalıştır ve 'ss' (spreadsheet) değişkeninde tut
+ss = connect_gsheets()
+
+
+# --- Antrenman Programı (Aynı kaldı) ---
 program_lower = [
-    "Bird Dog", "Superman", "Adduction (Kalça iç bacak makinesi)",
+    "Bird Dog", "Superman", "Adduction (Kalça iç bacak makinesi)", 
     "Leg Extension", "Leg Curl", "Leg Press", "Standing Calf Raise",
     "Machine Fly", "Incline Dumbbell Press"
 ]
@@ -26,114 +49,99 @@ program_hareketleri = sorted(list(set(program_lower + program_upper)))
 program_hareketleri.append("Diğer (Manuel Giriş)")
 
 
-# === YENİ VERİ FONKSİYONLARI (Google Sheets için) ===
+# === YENİ VERİ FONKSİYONLARI (gspread için yeniden yazıldı) ===
 
-# --- Antrenman ve Kilo Verileri (CSV yerine) ---
 def verileri_yukle(worksheet_adi, sutunlar):
     """
     Google E-Tablosu'ndan Antrenman veya Kilo verisini okur.
     """
+    if ss is None: return pd.DataFrame(columns=sutunlar) # Bağlantı hatası varsa boş döndür
     try:
-        df = conn.read(worksheet=worksheet_adi, usecols=list(range(len(sutunlar))), header=0)
-        df = df.dropna(how="all")
+        worksheet = ss.worksheet(worksheet_adi)
+        # 'get_all_records' başlık satırını (1. satır) kullanarak verileri sözlük listesi olarak alır
+        data = worksheet.get_all_records()
+        df = pd.DataFrame.from_records(data)
+        
+        if df.empty:
+            return pd.DataFrame(columns=sutunlar)
 
-        # Gelen veride sütun adı yoksa (örn. tamamen boş sayfa), bizimkini uygula
-        if len(df.columns) == len(sutunlar):
-            df.columns = sutunlar
-        else:
-            return pd.DataFrame(columns=sutunlar)  # Uyumsuzsa boş döndür
-
-        # Tarih formatını düzelt
-        if "Tarih" in df.columns:
-            df["Tarih"] = pd.to_datetime(df["Tarih"], format='mixed', errors='coerce')
-            df = df.dropna(subset=["Tarih"])  # Geçersiz tarih varsa o satırı at
-
+        df["Tarih"] = pd.to_datetime(df["Tarih"], format='mixed', errors='coerce')
+        df = df.dropna(subset=["Tarih"])
         return df
     except Exception as e:
         # st.warning(f"'{worksheet_adi}' sekmesi okunurken bir hata oluştu: {e}")
-        # st.info("Sekme boş olabilir, bu normaldir.")
         return pd.DataFrame(columns=sutunlar)
-
 
 def veri_kaydet(worksheet_adi, yeni_kayit_df):
     """
     Google E-Tablosu'na yeni bir Antrenman veya Kilo verisi satırı ekler.
     """
+    if ss is None: return False
     try:
+        worksheet = ss.worksheet(worksheet_adi)
+        # DataFrame'i başlıkları olmadan liste listesine çevir
         yeni_veri_listesi = yeni_kayit_df.values.tolist()
-        conn.append_rows(worksheet=worksheet_adi, values=yeni_veri_listesi)
+        # 'append_rows' kullanarak tablonun sonuna ekle
+        worksheet.append_rows(yeni_veri_listesi, value_input_option='USER_ENTERED')
         return True
     except Exception as e:
         st.error(f"Veri kaydedilirken hata oluştu: {e}")
         return False
 
-
-# --- Bırakma Tarihleri (JSON yerine) ---
-def yukle_birakma_tarihleri():
+# --- Bırakma Tarihleri ve Hedefler için (JSON yerine) ---
+def gsheet_to_dict(worksheet_adi, key_col, val_col):
     """
-    Google E-Tablosu'ndaki 'Tarihler' sekmesini okur ve bir sözlüğe (dict) çevirir.
+    'Tarihler' ve 'Hedefler' sekmelerini okumak için genel fonksiyon.
     """
+    if ss is None: return {}
     try:
-        df = conn.read(worksheet="Tarihler", usecols=[0, 1], header=0)
+        worksheet = ss.worksheet(worksheet_adi)
+        data = worksheet.get_all_records()
+        df = pd.DataFrame.from_records(data)
+        if df.empty:
+            return {}
         df = df.dropna(how="all")
-        return pd.Series(df.Tarih_Saat.values, index=df.Kategori).to_dict()
+        return pd.Series(df[val_col].values, index=df[key_col]).to_dict()
     except:
         return {}
 
+def dict_to_gsheet(worksheet_adi, data_dict, key_col, val_col):
+    """
+    'Tarihler' ve 'Hedefler' sekmelerini güncellemek için genel fonksiyon.
+    """
+    if ss is None: return False
+    try:
+        worksheet = ss.worksheet(worksheet_adi)
+        # Sözlüğü DataFrame'e dönüştür
+        df = pd.DataFrame(list(data_dict.items()), columns=[key_col, val_col])
+        
+        # Önce sayfayı temizle, sonra başlık + veriyi bas
+        worksheet.clear()
+        worksheet.update([df.columns.values.tolist()] + df.values.tolist(), value_input_option='USER_ENTERED')
+        return True
+    except Exception as e:
+        st.error(f"'{worksheet_adi}' sekmesi güncellenirken hata oluştu: {e}")
+        return False
+
+# --- Yeni fonksiyonları çağırma ---
+def yukle_birakma_tarihleri():
+    return gsheet_to_dict("Tarihler", "Kategori", "Tarih_Saat")
 
 def kaydet_birakma_tarihi(kategori, tarih_saat_objesi):
-    """
-    Google E-Tablosu'ndaki 'Tarihler' sekmesini günceller.
-    """
-    try:
-        df = conn.read(worksheet="Tarihler", header=0)
-        df = df.dropna(how="all")
+    data = yukle_birakma_tarihleri()
+    data[kategori] = tarih_saat_objesi.isoformat()
+    return dict_to_gsheet("Tarihler", data, "Kategori", "Tarih_Saat")
 
-        tarih_str = tarih_saat_objesi.isoformat()
-
-        if kategori in df["Kategori"].values:
-            df.loc[df["Kategori"] == kategori, "Tarih_Saat"] = tarih_str
-        else:
-            yeni_satir = pd.DataFrame([{"Kategori": kategori, "Tarih_Saat": tarih_str}])
-            df = pd.concat([df, yeni_satir], ignore_index=True)
-
-        conn.update(worksheet="Tarihler", data=df)
-        return True
-    except Exception as e:
-        st.error(f"Tarih kaydedilirken hata oluştu: {e}")
-        return False
-
-
-# --- Kilo Hedefleri (JSON yerine) ---
 def yukle_hedefler():
-    """
-    Google E-Tablosu'ndaki 'Hedefler' sekmesini okur ve bir sözlüğe çevirir.
-    """
-    try:
-        df = conn.read(worksheet="Hedefler", usecols=[0, 1], header=0)
-        df = df.dropna(how="all")
-        return pd.Series(df.Deger.values, index=df.Hedef_Adi).to_dict()
-    except:
-        return {}
-
+    return gsheet_to_dict("Hedefler", "Hedef_Adi", "Deger")
 
 def kaydet_hedefler(hedefler_dict):
-    """
-    Google E-Tablosu'ndaki 'Hedefler' sekmesini günceller.
-    """
-    try:
-        df = pd.DataFrame(list(hedefler_dict.items()), columns=["Hedef_Adi", "Deger"])
-        conn.update(worksheet="Hedefler", data=df)
-        return True
-    except Exception as e:
-        st.error(f"Hedefler kaydedilirken hata oluştu: {e}")
-        return False
-
-
+    return dict_to_gsheet("Hedefler", hedefler_dict, "Hedef_Adi", "Deger")
 # === YENİ VERİ FONKSİYONLARI BİTTİ ===
 
 
 # === TEMA: "DİSİPLİN" (CSS KODU) ===
+# (Bu kodda hiçbir değişiklik yok)
 discipline_css = """
 <style>
 /* ... (Tüm CSS kodunuz aynı kaldı, değişiklik yok) ... */
@@ -173,30 +181,30 @@ st.set_page_config(page_title="Gelişim Takipçisi", layout="wide")
 antrenman_df = verileri_yukle("Antrenman", ["Tarih", "Hareket", "Ağırlık_kg", "Tekrar"])
 kilo_df = verileri_yukle("Kilo", ["Tarih", "Kilo"])
 quit_dates = yukle_birakma_tarihleri()
-kilo_hedefleri = yukle_hedefler()
+kilo_hedefleri = yukle_hedefler() 
 
 # === KENAR ÇUBUĞU (SIDEBAR) ===
 with st.sidebar:
     st.title("Yeni Veri Girişi")
     st.markdown("Günlük kayıtlarınızı girin.")
-
+    
     with st.expander("🎯 Kilo Hedefleri Belirle", expanded=False):
         with st.form(key="hedef_formu"):
+            # Değerleri okurken float'a çevir (GSheets'ten string gelebilir)
             start_val = float(kilo_hedefleri.get("start_kilo", 0.0))
             goal_val = float(kilo_hedefleri.get("goal_kilo", 0.0))
-
+            
             start_kilo_input = st.number_input("Başlangıç Kilosu (kg)", min_value=0.0, value=start_val, format="%.1f")
             goal_kilo_input = st.number_input("Hedef Kilo (kg)", min_value=0.0, value=goal_val, format="%.1f")
-
+            
             hedef_kaydet_butonu = st.form_submit_button("Kilo Hedeflerini Kaydet")
-
+            
             if hedef_kaydet_butonu:
+                # GSheets'e kaydederken string'e çevirmek daha güvenli
                 yeni_hedefler = {"start_kilo": str(start_kilo_input), "goal_kilo": str(goal_kilo_input)}
                 if kaydet_hedefler(yeni_hedefler):
-                    st.success("Hedefler kaydedildi!");
-                    st.rerun()
-                else:
-                    st.error("Hedefler kaydedilemedi.")
+                    st.success("Hedefler kaydedildi!"); st.rerun()
+                else: st.error("Hedefler kaydedilemedi.")
 
     with st.expander("⚖️ Yeni Kilo Kaydet", expanded=False):
         with st.form(key="kilo_formu"):
@@ -206,13 +214,12 @@ with st.sidebar:
             if kilo_kaydet_butonu:
                 if kilo > 0:
                     yeni_kilo_veri_df = pd.DataFrame([
+                        # Tarihi GSheets'in anlayacağı bir string formatında gönder
                         {"Tarih": kilo_tarih.isoformat(), "Kilo": kilo}
                     ])
                     if veri_kaydet("Kilo", yeni_kilo_veri_df):
-                        st.success(f"{kilo} kg kaydedildi!");
-                        st.rerun()
-                else:
-                    st.error("Geçerli bir kilo girin.")
+                        st.success(f"{kilo} kg kaydedildi!"); st.rerun()
+                else: st.error("Geçerli bir kilo girin.")
 
     with st.expander("🏋️ Yeni Set Kaydet", expanded=True):
         with st.form(key="kayit_formu"):
@@ -229,14 +236,11 @@ with st.sidebar:
             if kaydet_butonu:
                 if secilen_hareket and secilen_hareket != "Diğer (Manuel Giriş)":
                     yeni_veri_df = pd.DataFrame([
-                        {"Tarih": ant_tarih.isoformat(), "Hareket": secilen_hareket, "Ağırlık_kg": agirlik,
-                         "Tekrar": int(tekrar)}
+                        {"Tarih": ant_tarih.isoformat(), "Hareket": secilen_hareket, "Ağırlık_kg": agirlik, "Tekrar": int(tekrar)}
                     ])
                     if veri_kaydet("Antrenman", yeni_veri_df):
-                        st.success(f"'{secilen_hareket}' seti eklendi!");
-                        st.rerun()
-                else:
-                    st.error("Lütfen geçerli bir hareket seçin.")
+                        st.success(f"'{secilen_hareket}' seti eklendi!"); st.rerun()
+                else: st.error("Lütfen geçerli bir hareket seçin.")
 
 # === ANA SAYFA İÇERİĞİ ===
 st.title("Kişisel Gelişim Paneli")
@@ -257,8 +261,7 @@ with col1:
             if len(kilo_df) > 1:
                 onceki_kilo = kilo_df.sort_values(by="Tarih", ascending=False).iloc[1]["Kilo"]
                 kilo_delta = son_kilo - onceki_kilo
-            st.metric("Mevcut Kilo", f"{son_kilo:.1f} kg",
-                      f"{kilo_delta:.1f} kg" if kilo_delta is not None else "İlk Kayıt")
+            st.metric("Mevcut Kilo", f"{son_kilo:.1f} kg", f"{kilo_delta:.1f} kg" if kilo_delta is not None else "İlk Kayıt")
         else:
             st.metric("Mevcut Kilo", "Kayıt Yok")
     else:
@@ -269,8 +272,7 @@ with col2:
         antrenman_df = antrenman_df.dropna(subset=["Ağırlık_kg"])
         if not antrenman_df.empty:
             best_lift = antrenman_df.loc[antrenman_df['Ağırlık_kg'].idxmax()]
-            st.metric("Kişisel Rekor (PR)", f"{best_lift['Ağırlık_kg']:.1f} kg",
-                      f"{best_lift['Hareket']} ({best_lift['Tekrar']} tekrar)")
+            st.metric("Kişisel Rekor (PR)", f"{best_lift['Ağırlık_kg']:.1f} kg", f"{best_lift['Hareket']} ({best_lift['Tekrar']} tekrar)")
         else:
             st.metric("Kişisel Rekor (PR)", "Kayıt Yok")
     else:
@@ -284,7 +286,7 @@ st.markdown("---")
 st.header("Odak Alanları")
 tab_matrix, tab_grafik, tab_kilo, tab_sigara, tab_lol = st.tabs([
     "📈 Gelişim Matrisi",
-    "🏋️ Antrenman Grafikleri",
+    "🏋️ Antrenman Grafikleri", 
     "⚖️ Vücut Ağırlığı",
     "🚬 Sigarayı Bırakma",
     "🎮 LoL'ü Bırakma"
@@ -300,15 +302,13 @@ with tab_matrix:
         antrenman_df["Ağırlık_kg"] = pd.to_numeric(antrenman_df["Ağırlık_kg"], errors='coerce')
         antrenman_df["Tekrar"] = pd.to_numeric(antrenman_df["Tekrar"], errors='coerce')
         antrenman_df_clean = antrenman_df.dropna(subset=["Ağırlık_kg", "Tekrar"])
-
+        
         defined_exercises = [ex for ex in program_hareketleri if ex != "Diğer (Manuel Giriş)"]
         summary_data = []
         for hareket in defined_exercises:
             hareket_df = antrenman_df_clean[antrenman_df_clean["Hareket"] == hareket]
             if hareket_df.empty:
-                summary_data.append(
-                    {"Hareket": hareket, "En Son Ağırlık (kg)": "-", "En Son Tekrar": "-", "En İyi Ağırlık (PR)": "-",
-                     "En Son Tarih": "-", "Toplam Set": 0})
+                summary_data.append({"Hareket": hareket, "En Son Ağırlık (kg)": "-", "En Son Tekrar": "-", "En İyi Ağırlık (PR)": "-", "En Son Tarih": "-", "Toplam Set": 0})
             else:
                 hareket_df_sorted = hareket_df.sort_values(by="Tarih", ascending=False)
                 last_entry = hareket_df_sorted.iloc[0]
@@ -331,23 +331,23 @@ with tab_grafik:
     else:
         kayitli_hareketler = sorted(antrenman_df["Hareket"].unique())
         grafik_icin_hareket = st.selectbox("Hangi hareketin grafiğini görmek istersin?", kayitli_hareketler)
-
+        
         antrenman_df["Ağırlık_kg"] = pd.to_numeric(antrenman_df["Ağırlık_kg"], errors='coerce')
         antrenman_df["Tekrar"] = pd.to_numeric(antrenman_df["Tekrar"], errors='coerce')
         antrenman_df_numeric = antrenman_df.dropna(subset=['Ağırlık_kg', 'Tekrar'])
-
+        
         hareket_df = antrenman_df_numeric[antrenman_df_numeric["Hareket"] == grafik_icin_hareket].copy()
-
+        
         if not hareket_df.empty:
             hareket_df = hareket_df.sort_values(by="Tarih")
-
+            
             st.subheader(f"{grafik_icin_hareket} - Ağırlık Galişimi (kg)")
             st.line_chart(hareket_df, x="Tarih", y="Ağırlık_kg")
-
+            
             hareket_df["Hacim (kg)"] = hareket_df["Ağırlık_kg"] * hareket_df["Tekrar"]
             st.subheader(f"{grafik_icin_hareket} - Hacim Gelişimi (Ağırlık x Tekrar)")
             st.line_chart(hareket_df, x="Tarih", y="Hacim (kg)")
-
+            
             with st.expander("Bu harekete ait tüm set kayıtları"):
                 st.dataframe(hareket_df.sort_values(by="Tarih", ascending=False))
         else:
@@ -360,7 +360,7 @@ with tab_kilo:
     else:
         kilo_df["Kilo"] = pd.to_numeric(kilo_df["Kilo"], errors='coerce')
         kilo_df_sirali = kilo_df.dropna(subset=["Kilo"]).sort_values(by="Tarih")
-
+        
         if kilo_df_sirali.empty:
             st.info("Grafik göstermek için geçerli kilo kaydı yok.")
         else:
@@ -370,32 +370,28 @@ with tab_kilo:
                 y=alt.Y('Kilo', title='Kilo (kg)'),
                 tooltip=['Tarih', 'Kilo']
             ).interactive()
-
+            
             chart_layers = [base_chart]
             start_kilo = float(kilo_hedefleri.get("start_kilo", 0))
             goal_kilo = float(kilo_hedefleri.get("goal_kilo", 0))
-
+            
             if start_kilo > 0:
-                start_line = alt.Chart(pd.DataFrame({'y': [start_kilo]})).mark_rule(color='#FFA500',
-                                                                                    strokeDash=[5, 5]).encode(y='y')
-                start_text = alt.Chart(
-                    pd.DataFrame({'y': [start_kilo], 'label': [f'Başlangıç: {start_kilo} kg']})).mark_text(
+                start_line = alt.Chart(pd.DataFrame({'y': [start_kilo]})).mark_rule(color='#FFA500', strokeDash=[5,5]).encode(y='y')
+                start_text = alt.Chart(pd.DataFrame({'y': [start_kilo], 'label': [f'Başlangıç: {start_kilo} kg']})).mark_text(
                     align='left', dx=5, dy=-10, color='#FFA500', baseline='bottom'
                 ).encode(y='y', text='label')
-                chart_layers.append(start_line);
-                chart_layers.append(start_text)
-
+                chart_layers.append(start_line); chart_layers.append(start_text)
+            
             if goal_kilo > 0:
                 goal_line = alt.Chart(pd.DataFrame({'y': [goal_kilo]})).mark_rule(color='#238636').encode(y='y')
                 goal_text = alt.Chart(pd.DataFrame({'y': [goal_kilo], 'label': [f'Hedef: {goal_kilo} kg']})).mark_text(
                     align='left', dx=5, dy=-10, color='#238636', baseline='bottom'
                 ).encode(y='y', text='label')
-                chart_layers.append(goal_line);
-                chart_layers.append(goal_text)
+                chart_layers.append(goal_line); chart_layers.append(goal_text)
 
             final_chart = alt.layer(*chart_layers).properties(title='Kilo Değişim Grafiği')
             st.altair_chart(final_chart, use_container_width=True)
-
+            
             st.subheader("Haftalık Kilo Ortalaması")
             try:
                 kilo_df_haftalik = kilo_df_sirali.set_index("Tarih").resample('W')["Kilo"].mean()
@@ -405,7 +401,7 @@ with tab_kilo:
                     st.info("Haftalık ortalama için yeterli veri yok.")
             except Exception as e:
                 st.error(f"Haftalık ortalama hesaplanırken bir hata oluştu: {e}")
-
+            
             with st.expander("Tüm kilo kayıtları"):
                 st.dataframe(kilo_df_sirali.sort_values(by="Tarih", ascending=False))
 
@@ -413,42 +409,37 @@ with tab_kilo:
 with tab_sigara:
     st.subheader("Sigarayı Bırakma Takipçisi")
     kategori_key = "smoking_quit_date"
-
+    
     if kategori_key in quit_dates:
         try:
             quit_datetime = datetime.datetime.fromisoformat(quit_dates[kategori_key])
             simdi = datetime.datetime.now()
             gecen_zaman = (simdi - quit_datetime)
-
+            
             if gecen_zaman.total_seconds() < 0:
-                toplam_gun = 0;
-                kalan_saat = 0
-                st.warning(
-                    f"Bırakma tarihi gelecek bir tarih ({quit_datetime.strftime('%Y-%m-%d %H:%M')}). Sayaç 0 olarak ayarlandı.")
+                toplam_gun = 0; kalan_saat = 0
+                st.warning(f"Bırakma tarihi gelecek bir tarih ({quit_datetime.strftime('%Y-%m-%d %H:%M')}). Sayaç 0 olarak ayarlandı.")
             else:
-                toplam_gun = gecen_zaman.days;
-                kalan_saat = gecen_zaman.seconds // 3600
-
+                toplam_gun = gecen_zaman.days; kalan_saat = gecen_zaman.seconds // 3600
+            
             gosterim_metni = f"{toplam_gun} gün {kalan_saat} saat"
             st.metric("🚭 Sigarasız Geçen Süre", gosterim_metni)
             st.success(f"Tebrikler! {quit_datetime.strftime('%Y-%m-%d %H:%M')} tarihinden beri sigara içmiyorsunuz.")
-
+            
             with st.expander("Tarihi/Saati Değiştir veya Sıfırla"):
                 st.error("Yeni bir tarih/saat seçmek, eski kaydı kalıcı olarak değiştirecektir.")
                 guncel_tarih = st.date_input("Yeni Bırakma Tarihi", value=quit_datetime.date(), key="sigara_yeni_tarih")
                 guncel_saat = st.time_input("Yeni Bırakma Saati", value=quit_datetime.time(), key="sigara_yeni_saat")
-
+                
                 if st.button("Tarihi Güncelle", key="sigara_guncelle"):
                     yeni_datetime = datetime.datetime.combine(guncel_tarih, guncel_saat)
                     if kaydet_birakma_tarihi(kategori_key, yeni_datetime):
-                        st.success("Tarih/saat güncellendi!");
-                        st.rerun()
-
+                        st.success("Tarih/saat güncellendi!"); st.rerun()
+                        
         except Exception as e:
             st.error(f"Kayıtlı tarih okunurken bir hata oluştu: {e}. Lütfen tarihi sıfırlayın.")
             if st.button("Kaydı Sıfırla", key="sigara_bozuk_sifirla"):
-                kaydet_birakma_tarihi(kategori_key, datetime.datetime.now());
-                st.rerun()
+                 kaydet_birakma_tarihi(kategori_key, datetime.datetime.now()); st.rerun()
     else:
         st.info("Sigarayı bıraktığınız tarih ve saati seçin, sayacı başlatın.")
         with st.form(key="sigara_formu"):
@@ -459,68 +450,56 @@ with tab_sigara:
                 yeni_datetime = datetime.datetime.combine(secilen_tarih, secilen_saat)
                 if yeni_datetime > datetime.datetime.now(): st.warning("Gelecek bir tarih/saat seçtiniz.")
                 if kaydet_birakma_tarihi(kategori_key, yeni_datetime):
-                    st.success("Tarih/saat kaydedildi! Sayacınız başladı.");
-                    st.rerun()
-                else:
-                    st.error("Tarih/saat kaydedilemedi.")
+                    st.success("Tarih/saat kaydedildi! Sayacınız başladı."); st.rerun()
+                else: st.error("Tarih/saat kaydedilemedi.")
 
 # --- Sekme 5: LoL Bırakma ---
 with tab_lol:
     st.subheader("League of Legends Bırakma Takipçisi")
     kategori_key_lol = "lol_quit_date"
-
+    
     if kategori_key_lol in quit_dates:
         try:
             quit_datetime_lol = datetime.datetime.fromisoformat(quit_dates[kategori_key_lol])
             simdi_lol = datetime.datetime.now()
             gecen_zaman_lol = (simdi_lol - quit_datetime_lol)
-
+            
             if gecen_zaman_lol.total_seconds() < 0:
-                toplam_gun_lol = 0;
-                kalan_saat_lol = 0
-                st.warning(
-                    f"Bırakma tarihi gelecek bir tarih ({quit_datetime_lol.strftime('%Y-%m-%d %H:%M')}). Sayaç 0 olarak ayarlandı.")
+                toplam_gun_lol = 0; kalan_saat_lol = 0
+                st.warning(f"Bırakma tarihi gelecek bir tarih ({quit_datetime_lol.strftime('%Y-%m-%d %H:%M')}). Sayaç 0 olarak ayarlandı.")
             else:
-                toplam_gun_lol = gecen_zaman_lol.days;
-                kalan_saat_lol = gecen_zaman_lol.seconds // 3600
-
+                toplam_gun_lol = gecen_zaman_lol.days; kalan_saat_lol = gecen_zaman_lol.seconds // 3600
+            
             gosterim_metni_lol = f"{toplam_gun_lol} gün {kalan_saat_lol} saat"
             st.metric("🎮 Oynamadan Geçen Süre", gosterim_metni_lol)
             st.success(f"Tebrikler! {quit_datetime_lol.strftime('%Y-%m-%d %H:%M')} tarihinden beri oynamıyorsunuz.")
-
+            
             with st.expander("Tarihi/Saati Değiştir veya Sıfırla"):
                 st.error("Yeni bir tarih/saat seçmek, eski kaydı kalıcı olarak değiştirecektir.")
-                guncel_tarih_lol = st.date_input("Yeni Bırakma Tarihi", value=quit_datetime_lol.date(),
-                                                 key="lol_yeni_tarih")
-                guncel_saat_lol = st.time_input("Yeni Bırakma Saati", value=quit_datetime_lol.time(),
-                                                key="lol_yeni_saat")
-
+                guncel_tarih_lol = st.date_input("Yeni Bırakma Tarihi", value=quit_datetime_lol.date(), key="lol_yeni_tarih")
+                guncel_saat_lol = st.time_input("Yeni Bırakma Saati", value=quit_datetime_lol.time(), key="lol_yeni_saat")
+                
                 if st.button("Tarihi Güncelle", key="lol_guncelle"):
                     yeni_datetime_lol = datetime.datetime.combine(guncel_tarih_lol, guncel_saat_lol)
                     if kaydet_birakma_tarihi(kategori_key_lol, yeni_datetime_lol):
-                        st.success("Tarih/saat güncellendi!");
-                        st.rerun()
-
+                        st.success("Tarih/saat güncellendi!"); st.rerun()
+                        
         except Exception as e:
             st.error(f"Kayıtlı tarih okunurken bir hata oluştu: {e}. Lütfen tarihi sıfırlayın.")
             if st.button("Kaydı Sıfırla", key="lol_bozuk_sifirla"):
-                kaydet_birakma_tarihi(kategori_key_lol, datetime.datetime.now());
-                st.rerun()
+                 kaydet_birakma_tarihi(kategori_key_lol, datetime.datetime.now()); st.rerun()
     else:
         st.info("League of Legends'ı bıraktığınız tarih ve saati seçin, sayacı başlatın.")
         with st.form(key="lol_formu"):
             secilen_tarih_lol = st.date_input("Hangi tarihte bıraktınız?", datetime.date.today(), key="lol_tarih")
-            secilen_saat_lol = st.time_input("Hangi saatte bıraktınız? (24-saat formatı)", datetime.time(0, 0),
-                                             key="lol_saat")
+            secilen_saat_lol = st.time_input("Hangi saatte bıraktınız? (24-saat formatı)", datetime.time(0, 0), key="lol_saat")
             kaydet_butonu_lol = st.form_submit_button("Sayacı Başlat")
             if kaydet_butonu_lol:
                 yeni_datetime_lol = datetime.datetime.combine(secilen_tarih_lol, secilen_saat_lol)
                 if yeni_datetime_lol > datetime.datetime.now(): st.warning("Gelecek bir tarih/saat seçtiniz.")
                 if kaydet_birakma_tarihi(kategori_key_lol, yeni_datetime_lol):
-                    st.success("Tarih/saat kaydedildi! Sayacınız başladı.");
-                    st.rerun()
-                else:
-                    st.error("Tarih/saat kaydedilemedi.")
+                    st.success("Tarih/saat kaydedildi! Sayacınız başladı."); st.rerun()
+                else: st.error("Tarih/saat kaydedilemedi.")
 
 # --- Sağ Alt Köşe Yazısı ---
 bottom_right_text_html = """
