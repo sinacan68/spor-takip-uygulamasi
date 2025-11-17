@@ -2,28 +2,30 @@ import streamlit as st
 import pandas as pd
 import datetime
 import os
-import json 
+import json # YENİ: JSON metnini okumak için eklendi
 import altair as alt
-import gspread # YENİ: Doğrudan Google'ın kütüphanesini kullanıyoruz
-from oauth2client.service_account import ServiceAccountCredentials # YENİ: Kimlik doğrulama için
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# --- GSheets Veritabanı Bağlantısını Kur (YENİ YÖNTEM) ---
+# --- GSheets Veritabanı Bağlantısını Kur (DÜZELTİLMİŞ YÖNTEM) ---
 
-# Bu fonksiyon, Streamlit'in "Secrets" (Gizli Anahtarlar) bölümünden robotun şifresini
-# (service_account_info) ve E-Tablo adını (worksheet_name) okur.
 def connect_gsheets():
     try:
-        # Secrets'tan robotun JSON şifresini al
-        creds_json = st.secrets["connections"]["gsheets"]["service_account_info"]
-        # Secrets'tan E-Tablo adını al
+        # 1. Adım: Secrets'tan robotun JSON şifresini (BÜYÜK BİR METİN olarak) al
+        # Not: Key adını 'service_account_info_str' olarak değiştirdik
+        creds_str = st.secrets["connections"]["gsheets"]["service_account_info_str"]
+        
+        # 2. Adım: Bu metni JSON'a (sözlüğe) çevir
+        creds_json = json.loads(creds_str) 
+        
+        # 3. Adım: Secrets'tan E-Tablo adını al
         worksheet_name = st.secrets["connections"]["gsheets"]["worksheet_name"]
         
-        # Google API'lerine bağlanmak için kimlik doğrula
+        # 4. Adım: Kimlik doğrula (eskisi gibi)
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
         client = gspread.authorize(creds)
         
-        # E-Tablo'yu adıyla aç ve istemciyi döndür
         spreadsheet = client.open(worksheet_name)
         return spreadsheet
     except Exception as e:
@@ -52,47 +54,39 @@ program_hareketleri.append("Diğer (Manuel Giriş)")
 # === YENİ VERİ FONKSİYONLARI (gspread için yeniden yazıldı) ===
 
 def verileri_yukle(worksheet_adi, sutunlar):
-    """
-    Google E-Tablosu'ndan Antrenman veya Kilo verisini okur.
-    """
-    if ss is None: return pd.DataFrame(columns=sutunlar) # Bağlantı hatası varsa boş döndür
+    if ss is None: return pd.DataFrame(columns=sutunlar) 
     try:
         worksheet = ss.worksheet(worksheet_adi)
-        # 'get_all_records' başlık satırını (1. satır) kullanarak verileri sözlük listesi olarak alır
         data = worksheet.get_all_records()
         df = pd.DataFrame.from_records(data)
         
         if df.empty:
             return pd.DataFrame(columns=sutunlar)
-
-        df["Tarih"] = pd.to_datetime(df["Tarih"], format='mixed', errors='coerce')
-        df = df.dropna(subset=["Tarih"])
+        
+        # Gelen veride sütun adı yoksa (örn. tamamen boş sayfa), bizimkini uygula
+        if len(df.columns) == len(sutunlar):
+             df.columns = sutunlar
+        
+        if "Tarih" in df.columns:
+            df["Tarih"] = pd.to_datetime(df["Tarih"], format='mixed', errors='coerce')
+            df = df.dropna(subset=["Tarih"])
+            
         return df
     except Exception as e:
-        # st.warning(f"'{worksheet_adi}' sekmesi okunurken bir hata oluştu: {e}")
         return pd.DataFrame(columns=sutunlar)
 
 def veri_kaydet(worksheet_adi, yeni_kayit_df):
-    """
-    Google E-Tablosu'na yeni bir Antrenman veya Kilo verisi satırı ekler.
-    """
     if ss is None: return False
     try:
         worksheet = ss.worksheet(worksheet_adi)
-        # DataFrame'i başlıkları olmadan liste listesine çevir
         yeni_veri_listesi = yeni_kayit_df.values.tolist()
-        # 'append_rows' kullanarak tablonun sonuna ekle
         worksheet.append_rows(yeni_veri_listesi, value_input_option='USER_ENTERED')
         return True
     except Exception as e:
         st.error(f"Veri kaydedilirken hata oluştu: {e}")
         return False
 
-# --- Bırakma Tarihleri ve Hedefler için (JSON yerine) ---
 def gsheet_to_dict(worksheet_adi, key_col, val_col):
-    """
-    'Tarihler' ve 'Hedefler' sekmelerini okumak için genel fonksiyon.
-    """
     if ss is None: return {}
     try:
         worksheet = ss.worksheet(worksheet_adi)
@@ -106,16 +100,10 @@ def gsheet_to_dict(worksheet_adi, key_col, val_col):
         return {}
 
 def dict_to_gsheet(worksheet_adi, data_dict, key_col, val_col):
-    """
-    'Tarihler' ve 'Hedefler' sekmelerini güncellemek için genel fonksiyon.
-    """
     if ss is None: return False
     try:
         worksheet = ss.worksheet(worksheet_adi)
-        # Sözlüğü DataFrame'e dönüştür
         df = pd.DataFrame(list(data_dict.items()), columns=[key_col, val_col])
-        
-        # Önce sayfayı temizle, sonra başlık + veriyi bas
         worksheet.clear()
         worksheet.update([df.columns.values.tolist()] + df.values.tolist(), value_input_option='USER_ENTERED')
         return True
@@ -141,7 +129,6 @@ def kaydet_hedefler(hedefler_dict):
 
 
 # === TEMA: "DİSİPLİN" (CSS KODU) ===
-# (Bu kodda hiçbir değişiklik yok)
 discipline_css = """
 <style>
 /* ... (Tüm CSS kodunuz aynı kaldı, değişiklik yok) ... */
@@ -190,17 +177,12 @@ with st.sidebar:
     
     with st.expander("🎯 Kilo Hedefleri Belirle", expanded=False):
         with st.form(key="hedef_formu"):
-            # Değerleri okurken float'a çevir (GSheets'ten string gelebilir)
             start_val = float(kilo_hedefleri.get("start_kilo", 0.0))
             goal_val = float(kilo_hedefleri.get("goal_kilo", 0.0))
-            
             start_kilo_input = st.number_input("Başlangıç Kilosu (kg)", min_value=0.0, value=start_val, format="%.1f")
             goal_kilo_input = st.number_input("Hedef Kilo (kg)", min_value=0.0, value=goal_val, format="%.1f")
-            
             hedef_kaydet_butonu = st.form_submit_button("Kilo Hedeflerini Kaydet")
-            
             if hedef_kaydet_butonu:
-                # GSheets'e kaydederken string'e çevirmek daha güvenli
                 yeni_hedefler = {"start_kilo": str(start_kilo_input), "goal_kilo": str(goal_kilo_input)}
                 if kaydet_hedefler(yeni_hedefler):
                     st.success("Hedefler kaydedildi!"); st.rerun()
@@ -214,7 +196,6 @@ with st.sidebar:
             if kilo_kaydet_butonu:
                 if kilo > 0:
                     yeni_kilo_veri_df = pd.DataFrame([
-                        # Tarihi GSheets'in anlayacağı bir string formatında gönder
                         {"Tarih": kilo_tarih.isoformat(), "Kilo": kilo}
                     ])
                     if veri_kaydet("Kilo", yeni_kilo_veri_df):
