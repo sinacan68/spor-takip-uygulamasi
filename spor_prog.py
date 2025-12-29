@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import datetime
 import os
-import json 
+import json
 import altair as alt
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -11,7 +11,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 def connect_gsheets():
     try:
         creds_str = st.secrets["connections"]["gsheets"]["service_account_info_str"]
-        creds_json = json.loads(creds_str) 
+        creds_json = json.loads(creds_str)
         worksheet_name = st.secrets["connections"]["gsheets"]["worksheet_name"]
         
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -42,7 +42,7 @@ program_hareketleri.append("Diğer (Manuel Giriş)")
 
 # === VERİ FONKSİYONLARI ===
 def verileri_yukle(worksheet_adi, sutunlar):
-    if ss is None: return pd.DataFrame(columns=sutunlar) 
+    if ss is None: return pd.DataFrame(columns=sutunlar)
     try:
         worksheet = ss.worksheet(worksheet_adi)
         data = worksheet.get_all_records()
